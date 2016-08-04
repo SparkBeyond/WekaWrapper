@@ -1,20 +1,25 @@
 package com.sparkbeyond
 
-import java.io.{BufferedWriter, FileWriter, File}
+import java.io._
+import java.net.{InetSocketAddress, Socket}
+import java.nio.charset.Charset
 
 import org.apache.commons.lang.StringUtils
+import org.json4s.JsonAST.JValue
 import weka.classifiers.Classifier
-import weka.core.converters.ArffSaver
-import weka.core.converters.ConverterUtils.DataSource
 
 import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
+import org.json4s._
+import org.json4s.native.JsonMethods._
+import org.json4s.JsonDSL._
 
 object WekaWrapper {
 
   val usage = """ADD the Usage text"""
 
   def buildOptionMap(map : Map[String, String], list: List[String]) : Map[String, String] = {
-    def isSwitch(s : String) = (s(0) == '-')
+    def isSwitch(s : String) = (s.charAt(0) == '-')
     list match {
       case Nil => map
       case "-f" :: value :: tail =>
@@ -35,6 +40,10 @@ object WekaWrapper {
         buildOptionMap(map ++ Map("classValues" -> value), tail)
       case "-oc" :: value :: tail =>
         buildOptionMap(map ++ Map("onlyClass" -> value), tail)
+			case "-p" :: value :: tail =>
+				buildOptionMap(map ++ Map("port" -> value), tail)
+			case "-t" :: value :: tail =>
+				buildOptionMap(map ++ Map("tag" -> value), tail)
       case option :: value :: tail => {
         println("Unknown option " + option)
         buildOptionMap(map, tail)
@@ -54,7 +63,7 @@ object WekaWrapper {
     }
     val argsList = args.toList
     val action = argsList(0)
-    if (action !="TrainModel" && action !="Classify") {
+    if (action !="TrainModel" && action !="Classify" && action != "Persist") {
         println(usage)
         System.exit(1)
       }
@@ -90,7 +99,7 @@ object WekaWrapper {
       weka.core.SerializationHelper.write(outputPath.head, model)
     }
 
-    if (action == "Classify") {
+		else if (action == "Classify") {
 
       val testFilePath = optionMap.get("inputFile")
       val inputModelPath = optionMap.get("outputModel")
@@ -131,7 +140,97 @@ object WekaWrapper {
 
     }
 
+		else if (action == "Persist") {
+			val inputModelPath = optionMap("outputModel")
+			val isNominal = optionMap("isNominal").toBoolean
+			val numOfClasses = optionMap.getOrElse("numberOfClasses","2").toInt
 
+			val model = weka.core.SerializationHelper.read(inputModelPath).asInstanceOf[Classifier]
+			println(s"WekaWrapper persisting with model from $inputModelPath")
 
+			val port = optionMap("port").toInt
+			val identifyTag = optionMap("tag").toInt
+			println(s"Connecting to port $port and identifying with tag $identifyTag")
+
+			try {
+				val socket = new Socket(null: String, port)
+				socket.setTcpNoDelay(true) // Optimize for latency
+				val input = new DataInputStream(socket.getInputStream)
+				val output = new DataOutputStream(socket.getOutputStream)
+
+				while (true) {
+					val request = readMessage(input)
+					val tag = (request \ "tag").asInstanceOf[JInt].num.toInt
+					val payload = request \ "payload"
+
+					val result = if (payload == JString("identify")) JInt(identifyTag)
+					else {
+						try {
+							val testFilePath = (payload \ "inputFile").asInstanceOf[JString].s
+							val onlyClass = (payload \ "onlyClass").asInstanceOf[JBool].value
+
+							val testReader = InputTestReader(testFilePath)
+							val attrs = DataProcess.buildWekaAttributes(testReader.headers, testReader.attributes, isNominal, numOfClasses)
+							val instances = DataProcess.makeUnlabeledInstances("temp", testReader.parseFeatureValues(), testReader.numberDataOfLines, attrs)
+							val distributions = new ArrayBuffer[Array[Double]](instances.numInstances())
+							if (onlyClass) {
+								(0 until instances.numInstances()).view.foreach {
+									i => distributions += Array(model.classifyInstance(instances.instance(i)))
+								}
+							}
+							else {
+								(0 until instances.numInstances()).view.foreach {
+									i => distributions += model.distributionForInstance(instances.instance(i))
+								}
+							}
+
+							val writer = new StringWriter()
+							distributions.foreach(dist => writer.write(dist.mkString("\t") + "\n"))
+
+							JString(writer.toString)
+						}
+						catch {
+							case NonFatal(e) =>
+								val stringWriter = new StringWriter()
+								val writer = new PrintWriter(stringWriter)
+								e.printStackTrace(writer)
+								writer.flush()
+								JObject("error" -> JString(stringWriter.toString))
+						}
+					}
+
+					val response = JObject(
+						"tag" -> tag,
+						"isResponse" -> true,
+						"payload" -> result
+					)
+
+					writeMessage(output, response)
+				}
+			}
+			catch {
+				case NonFatal(e) =>
+					System.err.println(s"Exiting after error:")
+					e.printStackTrace()
+			}
+		}
   }
+
+	private lazy val charset = Charset.forName("UTF-8")
+
+	private def readMessage(input: DataInputStream): JValue = {
+		val size = input.readInt()
+		val bytes = new Array[Byte](size)
+		input.readFully(bytes)
+		val string = new String(bytes, charset)
+		parse(string)
+	}
+
+	private def writeMessage(output: DataOutputStream, msg: JValue): Unit = {
+		val string = compact(render(msg))
+		val bytes = string.getBytes(charset)
+		output.writeInt(bytes.length)
+		output.write(bytes)
+		output.flush()
+	}
 }
